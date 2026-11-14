@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>com.lumbridgecorp.lumbridge-voice-files</string>
+ <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>__HOME__/.local/bin/lumbridge-voice</string><string>sync-files</string></array>
+ <key>WatchPaths</key><array><string>__HOME__/Pictures/Screenshots</string></array>
+ <key>StartInterval</key><integer>600</integer>
+ <key>ThrottleInterval</key><integer>15</integer>
+ <key>StandardErrorPath</key><string>__HOME__/Library/Logs/Lumbridge Voice/files.log</string>
+ <key>StandardOutPath</key><string>__HOME__/Library/Logs/Lumbridge Voice/files.log</string>
+</dict></plist>

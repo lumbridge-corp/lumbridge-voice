@@ -1,0 +1,11 @@
+{
+ "_comment": "Example shared vocabulary. Phrases are names the speech model should spell exactly (keep them to real names: common words hijack decoding). Replacements are [regex, text] fix-ups applied to the transcript. The Mac app reads this format as fleet-vocab.json (voice.json \"fleet_vocab\" says where `lumbridge-voice learn` copies it from).",
+ "enabled": true,
+ "alpha": 1.0,
+ "context_score": 1.0,
+ "depth_scaling": 2.0,
+ "alternatives": 3,
+ "phrases": ["Lumbridge", "Kubernetes", "PostgreSQL"],
+ "replacements_enabled": true,
+ "replacements": [["\\bpost gres\\b", "Postgres"], ["\\blum bridge\\b", "Lumbridge"]]
+}

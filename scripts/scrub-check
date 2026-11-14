@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Fails when the tree holds something that must not be published.
+
+    scripts/scrub-check                 check the files git tracks in this checkout
+    scripts/scrub-check DIR             check a plain folder (an exported tree); --tree DIR is the same
+    scripts/scrub-check --gitleaks      also run gitleaks on the same files (when installed)
+
+Two layers of patterns, one regular expression per line ("#" starts a comment):
+
+  1. scripts/scrub-patterns.txt, in this repository. Generic shapes only:
+     private network addresses, home folders, email addresses, token formats.
+     Example users (/home/sam) and example mail domains (example.com) pass.
+  2. An extra list that is NOT in this repository: names that are private to
+     whoever publishes the tree. SCRUB_PATTERNS names the file that holds it
+     (a value with more than one line is taken as the list itself, for a CI
+     secret). Hits from this list print as path:line only, and its patterns
+     are never printed, so a log does not repeat what the list protects; set
+     SCRUB_SHOW=1 to see the text. When SCRUB_PATTERNS is unset the layer is
+     skipped with a notice; with SCRUB_REQUIRE_PRIVATE=1 that is an error.
+
+.scrub-allow lists accepted hits: "<path glob>:<regex>" ("*" also crosses
+"/"), with the reason in a comment above. The allowed text is cut from the
+line before it is checked, so an allowed example on a line never hides
+something else on the same line.
+
+Lock files, binary files, the pattern file and the allow file are not read.
+File names are checked as well as contents. Exit status: 0 clean, 1 hits, 2 cannot run.
+"""
+
+import fnmatch
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PUBLIC = "scripts/scrub-patterns.txt"
+ALLOW = ".scrub-allow"
+SKIP = ("*.lock", "*lock.json", PUBLIC, ALLOW)
+LONG = 1000
+# Text that is always fine: example users after /home/ or /Users/, example mail domains.
+FINE = [
+    re.compile(r"/(home|Users)/(sam|alex|alice|bob|user|you|me|test|example)\b"),
+    re.compile(r"[A-Za-z0-9._%+-]+@(example\.(com|org|net)|[a-z0-9.-]+\.(example|test|invalid)|lumbridgecorp\.com)\b"),
+]
+
+
+def lines_of(text):
+    return [l for l in (l.strip() for l in text.splitlines()) if l and not l.startswith("#")]
+
+
+def compile_layer(text, what):
+    out = []
+    for n, pattern in enumerate(lines_of(text), 1):
+        try:
+            out.append((n, re.compile(pattern)))
+        except re.error as e:
+            sys.exit(f"scrub-check: bad pattern {n} in {what}: {e}")
+    return out
+
+
+def read_allow(root):
+    path = os.path.join(root, ALLOW)
+    entries = []
+    if not os.path.isfile(path):
+        return entries
+    with open(path, encoding="utf-8") as f:
+        for n, line in enumerate(lines_of(f.read()), 1):
+            parts = line.split(":", 1)
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                sys.exit(f"scrub-check: {ALLOW} entry {n} needs '<path glob>:<regex>'")
+            try:
+                entries.append((parts[0], re.compile(parts[1])))
+            except re.error as e:
+                sys.exit(f"scrub-check: bad regex in {ALLOW} entry {n}: {e}")
+    return entries
+
+
+def tracked(root):
+    out = subprocess.run(["git", "-C", root, "ls-files", "-z"], check=True, capture_output=True).stdout
+    names = [n for n in out.decode().split("\0") if n]
+    # A submodule is a tracked name and a folder: its files are another project's.
+    return [n for n in names if os.path.isfile(os.path.join(root, n)) and not os.path.islink(os.path.join(root, n))]
+
+
+def walk(root):
+    names = []
+    for folder, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d != ".git"]
+        for f in files:
+            full = os.path.join(folder, f)
+            if f != ".git" and not os.path.islink(full):
+                names.append(os.path.relpath(full, root))
+    return sorted(names)
+
+
+def main():
+    args = sys.argv[1:]
+    root, tree, gitleaks = os.path.dirname(HERE), False, False
+    while args:
+        a = args.pop(0)
+        if a == "--tree" and args:
+            root, tree = os.path.abspath(args.pop(0)), True
+        elif a == "--gitleaks":
+            gitleaks = True
+        elif a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        elif not a.startswith("-") and os.path.isdir(a):
+            root, tree = os.path.abspath(a), True
+        else:
+            print(f"scrub-check: unknown argument {a}", file=sys.stderr)
+            return 2
+
+    with open(os.path.join(HERE, "scrub-patterns.txt"), encoding="utf-8") as f:
+        layers = [("generic", compile_layer(f.read(), PUBLIC), True)]
+    private = os.environ.get("SCRUB_PATTERNS", "").strip()
+    if private and "\n" not in private:
+        try:
+            with open(private, encoding="utf-8") as f:
+                private = f.read()
+        except OSError:
+            print("scrub-check: cannot read the file named by SCRUB_PATTERNS", file=sys.stderr)
+            return 2
+    show_private = os.environ.get("SCRUB_SHOW") == "1"
+    if private.strip():
+        layers.append(("private", compile_layer(private, "the private list"), False))
+    elif os.environ.get("SCRUB_REQUIRE_PRIVATE") == "1":
+        print("scrub-check: SCRUB_REQUIRE_PRIVATE=1 but SCRUB_PATTERNS is not set", file=sys.stderr)
+        return 2
+    else:
+        print("scrub-check: SCRUB_PATTERNS is not set; only the generic patterns were checked", file=sys.stderr)
+
+    allow = read_allow(root)
+    names = tree and walk(root) or tracked(root)
+    hits = files = 0
+
+    def check(name, where, text):
+        nonlocal hits
+        for ok in FINE:
+            text = ok.sub(" ", text)
+        for glob, ok in allow:
+            if fnmatch.fnmatch(name, glob):
+                text = ok.sub(" ", text)
+        for layer, patterns, show in layers:
+            for n, p in patterns:
+                if p.search(text):
+                    hits += 1
+                    if show:
+                        print(f"{name}:{where}: [{layer}: {p.pattern}] {text.strip()[:200]}")
+                    elif show_private:
+                        print(f"{name}:{where}: [{layer} list] {text.strip()[:200]}")
+                    else:
+                        print(f"{name}:{where}: [{layer} list]")
+                    return
+
+    for name in names:
+        if any(fnmatch.fnmatch(name, s) or fnmatch.fnmatch(os.path.basename(name), s) for s in SKIP):
+            continue
+        check(name, "name", name)
+        with open(os.path.join(root, name), "rb") as f:
+            data = f.read()
+        if b"\0" in data[:8192]:
+            continue
+        files += 1
+        for n, line in enumerate(data.decode("utf-8", "replace").splitlines(), 1):
+            # A very long line (minified or generated) is read in overlapping pieces, to keep the check fast.
+            for start in range(0, max(len(line), 1), LONG - 200):
+                check(name, n, line[start : start + LONG])
+
+    status = 0
+    if hits:
+        print(f"scrub-check: {hits} hit(s) in {files} text files. Fix them, or add a reasoned entry to {ALLOW}.")
+        status = 1
+    else:
+        print(f"scrub-check: clean ({files} text files, {len(layers)} pattern layer(s))")
+
+    if gitleaks:
+        if not shutil.which("gitleaks"):
+            print("scrub-check: gitleaks is not installed; skipped")
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                for name in names:
+                    dest = os.path.join(tmp, name)
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    shutil.copyfile(os.path.join(root, name), dest)
+                run = subprocess.run(["gitleaks", "dir", tmp, "--redact", "--no-banner", "--exit-code", "1"])
+                status = status or (1 if run.returncode else 0)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

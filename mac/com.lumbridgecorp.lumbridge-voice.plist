@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>com.lumbridgecorp.lumbridge-voice</string>
+ <key>ProgramArguments</key><array><string>/Applications/Lumbridge Voice.app/Contents/MacOS/LumbridgeVoice</string></array>
+ <key>RunAtLoad</key><true/>
+ <key>KeepAlive</key><true/>
+ <key>ProcessType</key><string>Interactive</string>
+ <key>StandardErrorPath</key><string>__HOME__/Library/Logs/Lumbridge Voice/app.log</string>
+ <key>StandardOutPath</key><string>__HOME__/Library/Logs/Lumbridge Voice/app.log</string>
+</dict></plist>

@@ -1,0 +1,14 @@
+# Accepted hits of scripts/scrub-check. One entry per line: <path glob>:<regex>
+# The matching text is cut from lines of matching files before the check, so
+# an entry allows exactly that text and nothing else on the line.
+# Every entry has its reason above it. Keep the list short.
+
+# The Mac app's docs name the address range its announce server accepts.
+mac/README.md:100\.64\.0\.0/10
+
+
+# Our own deployment, kept in the private repository only and left out of the
+# public tree by .export-exclude. It is checked by hand, not by this list.
+runtime-py/*:.*
+compat-py/*:.*
+deploy/*:.*

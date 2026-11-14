@@ -1,0 +1,25 @@
+# Lumbridge Voice settings. Every line here shows the built-in default.
+# Use:  lumbridge-voice --config /path/to/this.toml   (or LUMBRIDGE_VOICE_CONFIG)
+# Each setting can also be given in the environment, which wins over this file:
+#   LUMBRIDGE_VOICE_LISTEN, _ADAPTER, _MAX_UPLOAD_MB, _FFMPEG,
+#   _TRANSCRIBE_URL, _TRANSCRIBE_MODEL, _SPEAK_URL
+
+# The Python front listens on 0.0.0.0:8806. This default keeps out of its way.
+listen = "127.0.0.1:8816"
+
+# vllm = NVIDIA Nemotron 3.5 Transcribe on vLLM. mock = no model, for trying the front.
+adapter = "vllm"
+
+# Largest request accepted, in megabytes.
+max_upload_mb = 512
+
+# Used for who-said-what on audio that is not already 16 kHz mono WAV.
+ffmpeg = "ffmpeg"
+
+[transcribe]
+url = "http://127.0.0.1:8807"
+model = "nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4"
+
+# The text-to-speech server that POST /v1/audio/speech is handed to (Magpie today).
+[speak]
+url = "http://127.0.0.1:8808"

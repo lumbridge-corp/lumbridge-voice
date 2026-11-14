@@ -1,0 +1,6 @@
+# Versions the Python front ran with (Python 3.12.3), read with `pip freeze` on 2026-11-09.
+# Also needs the `ffmpeg` binary on PATH.
+fastapi==0.141.1
+uvicorn==0.54.0
+httpx==0.28.1
+python-multipart==0.0.32

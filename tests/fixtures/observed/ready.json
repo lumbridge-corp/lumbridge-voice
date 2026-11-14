@@ -1,0 +1,1 @@
+{"capabilities":["asr","diarization","speech-translation","tts"],"device":"auto","ready":true,"transcribe":"nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B-NVFP4","tts":"magpietts"}

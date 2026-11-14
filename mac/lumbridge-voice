@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""lumbridge-voice — manage Lumbridge Voice (right Option dictation) on this Mac.
+
+  lumbridge-voice                 status + last 5 dictations
+  lumbridge-voice last [N]        recent dictations (raw -> final)
+  lumbridge-voice add TERM...     always spell these exactly like this
+  lumbridge-voice fix HEARD RIGHT whenever "HEARD" comes out, write "RIGHT"
+  lumbridge-voice forget TERM     remove a term/fix everywhere and never re-learn it
+  lumbridge-voice learn           sync the shared vocab (voice.json "fleet_vocab") + learn new terms (nightly job)
+  lumbridge-voice vocab           print the current vocabulary
+  lumbridge-voice say TEXT|-      speak text (or stdin) in the Lumbridge Voice voice (Magpie)
+  lumbridge-voice voice [NAME]    show or set the voice: Leo (female), Jason, John, Sofia, Aria
+  lumbridge-voice sync-files      upload new screenshots (~/Pictures/Screenshots) to voice.json "files_api"
+                                  when it is set; keeps local copies
+
+Keys: hold right Option = push-to-talk · tap = hands-free (tap again to finish, Esc cancels)
+      ⌃⌥V = paste last dictation · ⌃⌥S = read the selected text aloud (again to stop)
+"""
+import json, os, re, subprocess, sys, time, urllib.request
+from collections import Counter
+from pathlib import Path
+
+HOME = Path.home()
+
+FILES_ID_PREFIX = "lumbridge-voice:"   # upload ids are derived from it and the file's bytes
+
+
+SUP = HOME / "Library/Application Support/Lumbridge Voice"
+HIST = SUP / "history"
+PERSONAL, LEARNED, FLEET = SUP / "vocab.json", SUP / "learned.json", SUP / "fleet-vocab.json"
+LABEL = "com.lumbridgecorp.lumbridge-voice"
+DEFAULT_BRAIN = "http://127.0.0.1:8000/v1/chat/completions"
+MAX_LEARNED = 120
+
+
+def load(p, default):
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return default
+
+
+def save(p, obj):
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(obj, indent=1, ensure_ascii=False) + "\n")
+    tmp.replace(p)
+
+
+def brain_url():
+    """Environment first, then voice.json "brain", then the built-in default (the same order as the app)."""
+    v = os.environ.get("LUMBRIDGE_VOICE_BRAIN") or load(SUP / "voice.json", {}).get("brain")
+    v = v.strip().rstrip("/") if isinstance(v, str) else ""
+    return v if v.startswith(("http://", "https://")) else DEFAULT_BRAIN
+
+
+def personal():
+    v = load(PERSONAL, {})
+    v.setdefault("terms", []); v.setdefault("fixes", []); v.setdefault("never", [])
+    v.setdefault("style", "")
+    return v
+
+
+def history(limit=None):
+    items = []
+    for f in sorted(HIST.glob("*.json")):
+        d = load(f, None)
+        if d:
+            items.append(d)
+    return items[-limit:] if limit else items
+
+
+def known_terms():
+    p, l, f = personal(), load(LEARNED, {}), load(FLEET, {})
+    terms = list(p["terms"]) + list(l.get("terms", []))
+    for x in f.get("phrases", []):
+        terms.append(x if isinstance(x, str) else x.get("phrase", ""))
+    for pat, rep in f.get("replacements", []):
+        if "\\" not in rep:
+            terms.append(rep)
+    seen, out = set(), []
+    for t in terms:
+        if t and t.lower() not in seen:
+            seen.add(t.lower()); out.append(t)
+    return out
+
+
+def cmd_last(n=10):
+    for d in history(int(n)):
+        raw, text = d.get("raw", ""), d.get("text", "")
+        mark = "" if raw.strip() == text.strip() else f"\n      raw: {raw}"
+        print(f"{d.get('at','')[:19]}  [{d.get('app','')}] {d.get('ms','?')}ms  {text or d.get('error','')}{mark}")
+
+
+def cmd_status():
+    h = history()
+    ok = subprocess.run(["launchctl", "list", LABEL], capture_output=True).returncode == 0
+    print(f"Lumbridge Voice: {'running' if ok else 'NOT loaded'}  ·  hold right Option to talk, tap for hands-free")
+    print(f"vocab: {len(personal()['terms'])} yours, {len(load(LEARNED, {}).get('terms', []))} learned, "
+          f"{len(known_terms())} total  ·  {len(h)} dictations in history")
+    if h:
+        print(); cmd_last(5)
+
+
+def cmd_add(terms):
+    v = personal()
+    for t in terms:
+        if t.lower() not in {x.lower() for x in v["terms"]}:
+            v["terms"].append(t)
+        v["never"] = [x for x in v["never"] if x.lower() != t.lower()]
+    save(PERSONAL, v); print("added:", ", ".join(terms))
+
+
+def cmd_fix(heard, right):
+    v = personal()
+    v["fixes"] = [f for f in v["fixes"] if f[0].lower() != heard.lower()] + [[heard, right]]
+    if right.lower() not in {x.lower() for x in v["terms"]}:
+        v["terms"].append(right)
+    save(PERSONAL, v); print(f'fix: "{heard}" -> "{right}"')
+
+
+def cmd_forget(term):
+    v, l = personal(), load(LEARNED, {})
+    low = term.lower()
+    v["terms"] = [t for t in v["terms"] if t.lower() != low]
+    v["fixes"] = [f for f in v["fixes"] if low not in (f[0].lower(), f[1].lower())]
+    v["never"] = sorted(set(v["never"]) | {term})
+    l["terms"] = [t for t in l.get("terms", []) if t.lower() != low]
+    l["fixes"] = [f for f in l.get("fixes", []) if low not in (f[0].lower(), f[1].lower())]
+    save(PERSONAL, v); save(LEARNED, l); print("forgotten (won't be re-learned):", term)
+
+
+def sync_fleet():
+    """Copy a shared vocabulary (the speech server's boosting.json format) to fleet-vocab.json.
+    voice.json "fleet_vocab" is an http(s) URL or an scp source (host:path). Unset: nothing to sync."""
+    src = load(SUP / "voice.json", {}).get("fleet_vocab")
+    if not isinstance(src, str) or not src.strip():
+        print("no shared vocab set (voice.json \"fleet_vocab\"); skipped")
+        return
+    src, tmp, err = src.strip(), SUP / "fleet-vocab.dl", ""
+    if src.startswith(("http://", "https://")):
+        try:
+            with urllib.request.urlopen(src, timeout=15) as r:
+                tmp.write_bytes(r.read())
+        except Exception as e:
+            err = str(e)
+    else:
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", src, str(tmp)],
+                           capture_output=True, text=True)
+        err = "" if r.returncode == 0 else r.stderr.strip()
+    if not err and load(tmp, None):
+        tmp.replace(FLEET); print("shared vocab synced from", src)
+    else:
+        print("shared vocab sync failed (keeping the old copy):", (err or "not JSON")[:200])
+
+
+def candidates():
+    """Words you actually use that a dictionary doesn't know: hostnames, projects, apps, dictations.
+    Read on this Mac only; the candidates are sent to the brain (voice.json "brain") to pick from."""
+    try:
+        words = {w.strip().lower() for w in open("/usr/share/dict/words")}
+    except OSError:
+        words = set()
+    c = Counter()
+    ssh = HOME / ".ssh/config"
+    if ssh.exists():
+        for line in ssh.read_text(errors="ignore").splitlines():
+            m = re.match(r"\s*Host\s+(.+)", line)
+            if m:
+                for h in m.group(1).split():
+                    if "*" not in h and "." not in h:
+                        c[h] += 3
+    for d in (HOME / "src").glob("*"):
+        if d.is_dir() and not d.name.startswith("."):
+            c[d.name] += 2
+    for a in Path("/Applications").glob("*.app"):
+        c[a.stem] += 1
+    texts = [d.get("text", "") for d in history()]
+
+    def common(w):
+        w = w.lower().replace("'s", "")
+        stems = {w, w[:-1], w[:-2], w[:-3], w[:-2] + "e", w[:-3] + "e", w[:-3] + "y"}
+        return any(x in words for x in stems if len(x) > 1)
+
+    for t in texts:
+        for sent in re.split(r"[.!?]\s+", t):
+            toks = re.findall(r"[A-Za-z][A-Za-z0-9.\-']*[A-Za-z0-9]", sent)
+            for i, w in enumerate(toks):
+                codey = bool(re.search(r"[a-z][A-Z]|[0-9]|\.[a-z]", w))
+                named = w[0].isupper() and i > 0 and w.upper() != w or (w.isupper() and len(w) <= 5)
+                if codey or (named and not common(w)):
+                    c[w] += 2
+    return c, texts
+
+
+def brain(prompt):
+    body = {"model": load(SUP / "voice.json", {}).get("brain_model", "brain"), "temperature": 0, "max_tokens": 2000,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "messages": [{"role": "user", "content": prompt}]}
+    req = urllib.request.Request(brain_url(), data=json.dumps(body).encode(), headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=180) as r:
+        txt = json.load(r)["choices"][0]["message"]["content"]
+    m = re.search(r"\{.*\}", txt, re.S)
+    return json.loads(m.group(0)) if m else {}
+
+
+def cmd_learn():
+    SUP.mkdir(parents=True, exist_ok=True)
+    sync_fleet()
+    p, l = personal(), load(LEARNED, {"terms": [], "fixes": []})
+    l.setdefault("terms", []); l.setdefault("fixes", []); l.setdefault("seen", [])
+    never = {x.lower() for x in p["never"]}
+    known = known_terms()
+    have = {t.lower() for t in known}
+    c, texts = candidates()
+    seen = {x.lower() for x in l["seen"]}
+    cand = [w for w, n in c.most_common(500)
+            if w.lower() not in have and w.lower() not in never and w.lower() not in seen][:200]
+    added, fixed = [], []
+    # Pass 1: small yes/no batches over grounded candidates (stable; each word judged once).
+    for i in range(0, len(cand), 40):
+        batch = cand[i:i + 40]
+        try:
+            out = brain(f"""The user is a software engineer who dictates to their Mac. Pick the words from this list that are
+names they would SAY OUT LOUD and that a speech model might misspell: their products, projects, companies,
+hostnames, people, tools, brands, technical jargon. Skip ordinary English words, file/folder names with
+build prefixes (pkg-, stage2-, guide-, corpus-), version strings and generic plurals. Fix casing if
+obviously wrong. If several are spelling variants of one name, return only the most common correct one.
+
+Words: {json.dumps(batch)}
+
+Return JSON only: {{"keep": ["..."]}}""")
+        except Exception as e:
+            print("brain unavailable:", e); break
+        for t in out.get("keep", []):
+            if (isinstance(t, str) and 2 < len(t) <= 40 and t.lower() not in have and t.lower() not in never
+                    and t.lower() in {x.lower() for x in batch}):
+                l["terms"].append(t); have.add(t.lower()); added.append(t)
+        l["seen"] += batch
+    # Pass 2: mishearings visible in recent dictations -> fixes to known terms.
+    recent = [d.get("text", "") for d in history()[-80:] if d.get("text")] + texts[-60:]
+    texts_low = "\n".join(recent).lower()
+    try:
+        out = brain(f"""These are speech-to-text outputs of the user's dictations. Known correct vocabulary:
+{", ".join(sorted(have))}
+
+Dictations:
+{chr(10).join("- " + t for t in recent)}
+
+Find words or phrases in the dictations that are clearly a MISHEARING of one of the known vocabulary terms
+(e.g. "Lumbrige" for "Lumbridge"). Only real mishearings, never normal words used normally, never just
+dropping words. Return JSON only: {{"fixes": [["wrong form exactly as in a dictation", "known term"]]}}""")
+    except Exception as e:
+        out = {}; print("brain unavailable for fixes:", e)
+    for f in out.get("fixes", []):
+        if (isinstance(f, list) and len(f) == 2 and all(isinstance(x, str) for x in f)
+                and f[0].lower() in texts_low and f[0].lower() != f[1].lower()
+                and f[1].lower() not in f[0].lower() and f[1].lower() in have
+                and f[0].lower() not in have and f[0].lower() not in never
+                and f[0].lower() not in {x[0].lower() for x in l["fixes"] + p["fixes"]}):
+            l["fixes"].append(f); fixed.append(f)
+    wrong = {f[0].lower() for f in l["fixes"]}
+    l["terms"] = [t for t in l["terms"] if t.lower() not in wrong][-MAX_LEARNED:]
+    l["seen"] = l["seen"][-3000:]
+    l["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    save(LEARNED, l)
+    print(f"learned {len(added)} terms: {', '.join(added) or '-'}")
+    for f in fixed:
+        print(f'learned fix: "{f[0]}" -> "{f[1]}"')
+    print("(undo anything with: lumbridge-voice forget TERM)")
+
+
+APP_BIN = "/Applications/Lumbridge Voice.app/Contents/MacOS/LumbridgeVoice"
+VOICES = ["Leo", "Jason", "John", "Sofia", "Aria"]  # this magpie build: "Leo" is the female voice
+
+
+def cmd_say(words):
+    text = sys.stdin.read() if words == ["-"] else " ".join(words)
+    if text.strip():
+        subprocess.run([APP_BIN, "--say", text], stdout=subprocess.DEVNULL)
+
+
+def cmd_voice(name=None):
+    cfg = load(SUP / "voice.json", {})
+    if not name:
+        print(f"voice: {cfg.get('voice', 'Leo')}  speed: {cfg.get('rate', 1.0)}  (choices: {', '.join(VOICES)})")
+        return
+    match = [v for v in VOICES if v.lower() == name.lower()]
+    if not match:
+        print("unknown voice; choose one of", ", ".join(VOICES)); return
+    cfg["voice"] = match[0]; save(SUP / "voice.json", cfg)
+    cmd_say([f"Hi, I'm {match[0]}."])
+
+
+SHOTS = HOME / "Pictures/Screenshots"
+FILES_STATE = SUP / "files-sync.json"
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".heic", ".gif"}
+
+
+def cmd_sync_files():
+    """Upload screenshots newer than the cutoff to voice.json "files_api", when it is set: POST the bytes to
+    <files_api>?id=<id>&name=<file name> with "Authorization: Bearer <files.token>". Idempotent: the id is
+    derived from the file's bytes."""
+    import hashlib, uuid, urllib.parse
+    files_api = load(SUP / "voice.json", {}).get("files_api")
+    if not isinstance(files_api, str) or not files_api.startswith(("http://", "https://")):
+        return
+    try:
+        token = (SUP / "files.token").read_text().strip()
+    except OSError:
+        print(f"no files.token in {SUP}: put the bearer token for files_api there"); return
+    st = load(FILES_STATE, {})
+    st.setdefault("cutoff", time.time())   # only screenshots taken after the first run, not the backlog
+    st.setdefault("done", {})
+    sent = failed = 0
+    for f in sorted(SHOTS.rglob("*")):
+        if not f.is_file() or f.suffix.lower() not in IMAGE_EXT or f.name.startswith("."):
+            continue
+        m = f.stat().st_mtime
+        if m < st["cutoff"]:
+            continue
+        if time.time() - m < 3:
+            time.sleep(3)                           # still being written (the watcher fires at once)
+        data = f.read_bytes()
+        digest = hashlib.sha256(data).hexdigest()
+        if digest in st["done"]:
+            continue
+        fid = str(uuid.uuid5(uuid.NAMESPACE_URL, FILES_ID_PREFIX + digest))
+        url = f"{files_api}?id={fid}&name={urllib.parse.quote(f.name)}"
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"Authorization": "Bearer " + token, "Content-Type": "application/octet-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                r.read()
+            st["done"][digest] = {"name": f.name, "id": fid, "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print(f"upload failed for {f.name}: {e}")
+            break                                   # gateway down or token revoked: try again next run
+    save(FILES_STATE, st)
+    print(f"sent {sent} screenshot(s) to {files_api}" + (f", {failed} failed (will retry)" if failed else ""))
+
+
+def main(a):
+    SUP.mkdir(parents=True, exist_ok=True); HIST.mkdir(exist_ok=True)
+    if not PERSONAL.exists():
+        save(PERSONAL, personal())
+    if not a:
+        return cmd_status()
+    c = a[0]
+    if c == "last": return cmd_last(a[1] if len(a) > 1 else 10)
+    if c == "add" and len(a) > 1: return cmd_add(a[1:])
+    if c == "fix" and len(a) == 3: return cmd_fix(a[1], a[2])
+    if c == "forget" and len(a) == 2: return cmd_forget(a[1])
+    if c == "learn": return cmd_learn()
+    if c == "sync": return sync_fleet()
+    if c == "vocab": return print(", ".join(known_terms()))
+    if c == "say" and len(a) > 1: return cmd_say(a[1:])
+    if c == "voice": return cmd_voice(a[1] if len(a) > 1 else None)
+    if c == "sync-files": return cmd_sync_files()
+    print(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
