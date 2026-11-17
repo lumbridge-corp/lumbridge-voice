@@ -1,3 +1,5 @@
+![Lumbridge Voice: Speech to text on your own machines.](docs/assets/banner.jpg)
+
 # Lumbridge Voice
 
 Speech to text: audio in, words out. A small HTTP front with an OpenAI-style API in front of a speech
@@ -5,6 +7,8 @@ model you run yourself, and a macOS dictation app (hold a key, talk, the words a
 holds no model: the model sits behind an adapter, so a new model is a new adapter, not a new API.
 
 Part of [Lumbridge](https://lumbridgecorp.com) ([all repos](https://github.com/lumbridge-corp)). In daily use.
+
+![Terminal: lumbridge-voice adds words to its vocabulary, fixes how two phrases are written and lists the vocabulary.](docs/assets/screenshot.png)
 
 ## Status
 
